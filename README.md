@@ -505,16 +505,125 @@ confs_params = GenerateConfsParams(
 
 ## Plugin Development
 
-MolForge supports custom plugin actors. See `molforge/actor_plugins/example.py` for a complete, documented template.
+MolForge supports custom plugin actors for extending the pipeline with domain-specific functionality. Plugins are automatically discovered and integrate seamlessly with the core framework.
 
-### Creating a Plugin
+### Quick Start
 
-1. Create parameter class inheriting from `BaseParams`
-2. Create actor class inheriting from `BaseActor`
-3. Implement required methods (`process`, properties)
-4. Place in `molforge/actor_plugins/`
+Custom actors are placed in `molforge/actor_plugins/` and automatically loaded at runtime. Each plugin consists of a parameter class and an actor class:
 
-See the example plugin for detailed guidance on parameter validation, error handling, and pipeline integration.
+```python
+from dataclasses import dataclass
+from molforge.actors.base import BaseActor
+from molforge.actors.params.base import BaseParams
+
+@dataclass
+class MyPluginParams(BaseParams):
+    my_parameter: str = 'default_value'
+
+class MyPlugin(BaseActor):
+    __step_name__ = 'my_plugin'  # Used in pipeline configuration
+    __param_class__ = MyPluginParams
+
+    def process(self, data):
+        # Your processing logic here
+        return data
+```
+
+### Using Plugins in Pipelines
+
+Reference plugins by their `__step_name__` in the pipeline steps, and configure them using `plugin_params`:
+
+```python
+from molforge import MolForge, ForgeParams
+
+params = ForgeParams(
+    steps=['source', 'chembl', 'curate', 'my_plugin'],  # Add plugin to steps
+    plugin_params={
+        'my_plugin': MyPluginParams(
+            my_parameter='custom_value'
+        )
+    }
+)
+
+forge = MolForge(params)
+df = forge.forge("CHEMBL234")
+```
+
+### Common Patterns
+
+#### Input and Output Specification
+
+Declare required input columns and output columns for pipeline validation:
+
+```python
+class MyPlugin(BaseActor):
+    @property
+    def required_columns(self):
+        return ['curated_smiles']  # Columns needed from previous actors
+
+    @property
+    def output_columns(self):
+        return ['my_property']  # Columns added by this actor
+```
+
+#### Handling Optional Dependencies
+
+Use graceful error handling for optional dependencies:
+
+```python
+@dataclass
+class MyPluginParams(BaseParams):
+    def _validate_params(self):
+        try:
+            import optional_library
+        except ImportError:
+            raise ImportError(
+                "optional_library required. Install with: pip install optional_library"
+            )
+```
+
+#### Pipeline Logging
+
+Use `self.log()` for consistent logging integration:
+
+```python
+def process(self, data):
+    self.log(f"Processing {len(data)} molecules")
+    # ... processing logic ...
+    self.log(f"Completed processing", level='DEBUG')
+    return data
+```
+
+### Testing Plugins
+
+Test plugins standalone before pipeline integration:
+
+```python
+import pandas as pd
+
+# Create test data
+test_data = pd.DataFrame({
+    'curated_smiles': ['CCO', 'c1ccccc1', 'CC(=O)O']
+})
+
+# Initialize and test
+params = MyPluginParams(my_parameter='test_value')
+plugin = MyPlugin(params)
+result = plugin.process(test_data)
+
+print(result)
+```
+
+### Complete Example
+
+See `molforge/actor_plugins/example.py` for a fully documented plugin template covering:
+- Parameter validation with `_validate_params()`
+- Actor initialization with `__post_init__()`
+- Robust error handling for individual molecules
+- Custom metadata in `_create_output()`
+- Integration with pipeline configuration
+
+The example plugin demonstrates calculating molecular descriptors with RDKit and serves as a reference for all plugin patterns.
 
 ---
 
