@@ -11,7 +11,6 @@ from pathlib import Path
 import json
 import time
 import gc
-import os
 
 import pandas as pd
 from rdkit import Chem
@@ -35,14 +34,6 @@ from molforge.actors.params.base import BaseParams
 from molforge.utils.constants import MAX_CHUNK_SIZE, DEFAULT_MP_THRESHOLD, DEFAULT_N_JOBS
 
 from dataclasses import dataclass
-
-
-# ============================================================================
-# CONSTANTS
-# ============================================================================
-
-# Chunk size for parallel processing (from molforge constants)
-CHUNK_SIZE = MAX_CHUNK_SIZE
 
 
 # ============================================================================
@@ -209,11 +200,8 @@ class CalculateTorsions(BaseActor):
     __step_name__ = 'torsion'
     __param_class__ = CalculateTorsionsParams
 
-    OUTPUT_COLUMNS = [
-        'torsion_name', 'torsion_smiles', 'torsion_mapping', 'torsion_success',
-        'n_confs', 'low_confs', 'n_ring_torsions', 'n_rotor_torsions',
-        'n_torsions', 'mean_variance', 'warnings'
-    ]
+    # Single source of truth for the added columns: the default result row.
+    OUTPUT_COLUMNS = list(_default_row())
 
     @property
     def required_columns(self) -> List[str]:
@@ -231,10 +219,10 @@ class CalculateTorsions(BaseActor):
         return 'torsion_mapping'
 
     @property
-    def torsions_dir(self) -> str:
+    def torsions_dir(self) -> Path:
         """Path to torsions directory in current run directory."""
-        dir_path = self._get_run_path("torsions")
-        os.makedirs(dir_path, exist_ok=True)
+        dir_path = Path(self._get_run_path("torsions"))
+        dir_path.mkdir(parents=True, exist_ok=True)
         return dir_path
 
     def __post_init__(self):
@@ -260,7 +248,7 @@ class CalculateTorsions(BaseActor):
 
         self.log(
             f"Torsion analysis initialized "
-            f"(workers: {DEFAULT_N_JOBS}, chunk_size: {CHUNK_SIZE:,})"
+            f"(workers: {DEFAULT_N_JOBS}, chunk_size: {MAX_CHUNK_SIZE:,})"
         )
 
     def process(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -342,6 +330,17 @@ class CalculateTorsions(BaseActor):
                 f"statistically reliable for these molecules."
             )
 
+        # Outcome funnel
+        n_success = len(successful)
+        n_removed = len(df) - n_success
+        pct_removed = (100 * n_removed / len(df)) if len(df) else 0.0
+        self.log(
+            f"Torsion analysis: {len(df):,} → {n_success:,} succeeded "
+            f"(removed {n_removed:,}, {pct_removed:.1f}%)  |  "
+            f"no conformers {n_without_confs:,}, failed {len(failed):,}, "
+            f"low conformers {n_low_confs:,}"
+        )
+
         # Drop failed rows if requested
         if self.dropna:
             initial_count = len(df)
@@ -372,13 +371,13 @@ class CalculateTorsions(BaseActor):
         """
         total_mols = len(names)
         use_mp = total_mols >= DEFAULT_MP_THRESHOLD
-        total_chunks = (total_mols + CHUNK_SIZE - 1) // CHUNK_SIZE
+        total_chunks = (total_mols + MAX_CHUNK_SIZE - 1) // MAX_CHUNK_SIZE
 
         # Dispatch log
         if use_mp:
             self.log(
                 f"Processing {total_mols:,} molecules "
-                f"with {DEFAULT_N_JOBS} workers ({total_chunks} chunks of {CHUNK_SIZE:,})."
+                f"with {DEFAULT_N_JOBS} workers ({total_chunks} chunks of {MAX_CHUNK_SIZE:,})."
             )
         else:
             self.log(
@@ -399,7 +398,7 @@ class CalculateTorsions(BaseActor):
             chunk_data.append((name, mol))
 
             # Process chunk when full or at end
-            if len(chunk_data) >= CHUNK_SIZE or i == total_mols - 1:
+            if len(chunk_data) >= MAX_CHUNK_SIZE or i == total_mols - 1:
                 chunk_start = time.time()
                 chunk_results, manifest_entry = self._process_chunk(
                     chunk_data, chunk_idx, use_mp
@@ -588,7 +587,7 @@ class CalculateTorsions(BaseActor):
             Manifest entry dict with file, names, and count
         """
         filename = f"chunk_{chunk_idx:04d}.pkl"
-        chunk_path = os.path.join(self.torsions_dir, filename)
+        chunk_path = self.torsions_dir / filename
 
         names = [
             mol.GetProp('_Name') if mol.HasProp('_Name') else ''
@@ -607,7 +606,7 @@ class CalculateTorsions(BaseActor):
         Args:
             manifest: List of chunk entries with file, names, count
         """
-        manifest_path = os.path.join(self.torsions_dir, "manifest.json")
+        manifest_path = self.torsions_dir / "manifest.json"
         with open(manifest_path, 'w') as f:
             json.dump(manifest, f, indent=2)
 
@@ -623,6 +622,9 @@ class CalculateTorsions(BaseActor):
             mean_metric = 0.0
             n_success = 0
 
+        manifest_path = self.torsions_dir / "manifest.json"
+        n_chunks = len(json.loads(manifest_path.read_text())) if manifest_path.exists() else 0
+
         return ActorOutput(
             data=data,
             success=True,
@@ -631,146 +633,7 @@ class CalculateTorsions(BaseActor):
                 'n_success': n_success,
                 'total_torsions': int(total_torsions),
                 'mean_metric': float(mean_metric),
-                'n_chunks': len(list(Path(self.torsions_dir).glob("chunk_*.pkl"))),
+                'n_chunks': n_chunks,
             },
             endpoint=self.forge_endpoint
         )
-
-    # ========================================================================
-    # RESULT ACCESS METHODS
-    # ========================================================================
-
-    def get_successful_names(self) -> List[str]:
-        """
-        Get list of successful molecule names from manifest.
-
-        Reads the lightweight manifest file without deserializing chunks.
-
-        Returns:
-            List of molecule names with torsion results, in chunk order
-        """
-        manifest_path = os.path.join(self.torsions_dir, "manifest.json")
-        if not os.path.exists(manifest_path):
-            self.log("Manifest not found — falling back to chunk deserialization", level='WARNING')
-            names = []
-            for chunk_path in sorted(Path(self.torsions_dir).glob("chunk_*.pkl")):
-                with open(chunk_path, 'rb') as f:
-                    molecules, _ = pickle.load(f)
-                for mol in molecules:
-                    names.append(mol.GetProp('_Name') if mol.HasProp('_Name') else '')
-            return names
-
-        with open(manifest_path, 'r') as f:
-            manifest = json.load(f)
-
-        names = []
-        for entry in manifest:
-            chunk_path = os.path.join(self.torsions_dir, entry['file'])
-            if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
-                names.extend(entry.get('names', []))
-
-        return names
-
-    def extract_results(self) -> Iterator[Tuple[Chem.Mol, Dict[int, float]]]:
-        """
-        Stream torsion results from cached pickle chunks.
-
-        Yields results one at a time to handle large datasets without
-        loading all into memory.
-
-        Yields:
-            (molecule, bond_mapping) tuples where molecules are RDKit Mol
-            objects and mappings are {bond_idx: variance} dicts
-
-        Raises:
-            FileNotFoundError: If no chunk files exist.
-        """
-        chunk_files = sorted(Path(self.torsions_dir).glob("chunk_*.pkl"))
-
-        if not chunk_files:
-            raise FileNotFoundError(
-                f"No torsion results found in {self.torsions_dir}.\n"
-                "Ensure the torsion actor has been run in this pipeline."
-            )
-
-        self.log(f"Streaming results from {len(chunk_files)} chunks")
-
-        total_yielded = 0
-        for chunk_path in chunk_files:
-            with open(chunk_path, 'rb') as f:
-                molecules, mappings = pickle.load(f)
-
-            for mol, mapping in zip(molecules, mappings):
-                yield mol, mapping
-                total_yielded += 1
-
-            # Free memory after each chunk
-            del molecules, mappings
-            gc.collect()
-
-        self.log(f"Streamed {total_yielded:,} molecules")
-
-    def extract_results_batch(
-        self,
-        batch_size: Optional[int] = None,
-    ) -> Iterator[Tuple[List[Chem.Mol], List[Dict[int, float]]]]:
-        """
-        Stream torsion results in batches.
-
-        Args:
-            batch_size: Number of molecules per batch. If None, yields
-                one chunk at a time (efficient for chunk-aligned processing).
-
-        Yields:
-            (molecules_batch, mappings_batch) tuples
-        """
-        chunk_files = sorted(Path(self.torsions_dir).glob("chunk_*.pkl"))
-
-        if not chunk_files:
-            raise FileNotFoundError(f"No torsion results found in {self.torsions_dir}")
-
-        if batch_size is None:
-            # Yield whole chunks
-            for chunk_path in chunk_files:
-                with open(chunk_path, 'rb') as f:
-                    molecules, mappings = pickle.load(f)
-                yield molecules, mappings
-        else:
-            # Yield custom batch sizes
-            mol_buffer = []
-            map_buffer = []
-
-            for chunk_path in chunk_files:
-                with open(chunk_path, 'rb') as f:
-                    molecules, mappings = pickle.load(f)
-
-                for mol, mapping in zip(molecules, mappings):
-                    mol_buffer.append(mol)
-                    map_buffer.append(mapping)
-
-                    if len(mol_buffer) >= batch_size:
-                        yield mol_buffer, map_buffer
-                        mol_buffer = []
-                        map_buffer = []
-
-                del molecules, mappings
-                gc.collect()
-
-            # Yield remaining
-            if mol_buffer:
-                yield mol_buffer, map_buffer
-
-    def get_results_count(self) -> int:
-        """
-        Get total count of successful results without loading data.
-
-        Returns:
-            Number of molecules with torsion results
-        """
-        count = 0
-        for chunk_path in Path(self.torsions_dir).glob("chunk_*.pkl"):
-            with open(chunk_path, 'rb') as f:
-                molecules, _ = pickle.load(f)
-                count += len(molecules)
-
-        return count
