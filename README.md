@@ -4,7 +4,9 @@
   # MolForge
 
   **A configurable pipeline for molecular data processing, curation, and conformer generation**
+  <a href="https://github.com/molML/molforge-paper"><b>preprint code</b></a>
 
+  [![Preprint](https://img.shields.io/badge/ChemRxiv-10.26434%2Fchemrxiv.15006508-b31b1b.svg)](https://doi.org/10.26434/chemrxiv.15006508/v1)
   [![Version](https://img.shields.io/badge/version-1.0.0-blue)](https://github.com/molML/molforge)
   [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
