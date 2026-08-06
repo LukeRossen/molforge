@@ -25,10 +25,10 @@ setup(
         'tqdm>=4.66.2',       # Progress bars (database downloads)
         'joblib>=1.3.2',      # Parallel processing (RDKit backend uses cloudpickle)
         'tabulate>=0.9.0',    # Formatted table output
+        'pyyaml>=5.4',        # YAML config file support
     ],
     extras_require={
         'cli': [
-            'pyyaml>=5.4',                      # YAML config file support
             'questionary>=2.0.0',               # Interactive CLI prompts
         ],
         'openeye': ['openeye-toolkits'],        # OpenEye OMEGA backend (optional)
@@ -42,5 +42,5 @@ setup(
             'molforge=molforge.cli.main:main',
         ],
     },
-    python_requires='>=3.12.1',
+    python_requires='>=3.12',
 )
