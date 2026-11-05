@@ -147,7 +147,7 @@ class TestTorsionPluginRDKit:
                 # Ibuprofen molecules should have rotatable torsions
                 if 'ibuprofen' in mol_id:
                     assert row['n_rotor_torsions'] > 0
-                    assert len(torsion_mapping.get('canonical_atom_ranks', [])) > 0
+                    assert len(torsion_mapping.get('smiles_atom_positions', [])) > 0
 
     def test_torsion_handles_failures(self, logger, pipeline_context):
         """Test torsion actor handles molecules without conformers."""

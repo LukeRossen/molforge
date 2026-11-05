@@ -19,12 +19,12 @@ from joblib import Parallel, delayed
 # Attempt to import private toolkit
 try:
     from phd_tools.chemistry.torsion import TorsionCalculator
-    from phd_tools.chemistry.savebonds import CanonicalBondProperties
+    from phd_tools.chemistry.savebonds import bond_values_at, key_by_position, parse_smiles
     TORSION_AVAILABLE = True
 except ImportError:
     TORSION_AVAILABLE = False
     TorsionCalculator = None
-    CanonicalBondProperties = None
+    bond_values_at = key_by_position = parse_smiles = None
 
 
 # Plugin imports
@@ -101,11 +101,11 @@ def _default_row(name: str = '') -> Dict:
 
 
 def _serialize_mapping(mapping: Dict) -> str:
-    """Serialize canonical mapping to JSON for CSV-safe storage."""
+    """Serialize mapping to JSON for CSV-safe storage."""
     if not mapping:
         return '{}'
     return json.dumps({
-        'canonical_atom_ranks': [list(k) for k in mapping.keys()],
+        'smiles_atom_positions': [list(k) for k in mapping.keys()],
         'circular_variance': list(mapping.values()),
     })
 
@@ -142,17 +142,14 @@ def _process_batch_worker(
 
         try:
             bond_variance, stats, rd_topology = calculator.compute(mol)
-            canonical_mapping = CanonicalBondProperties.bond_idx_to_canonical(
-                rd_topology, bond_variance
-            )
-            torsion_smiles = Chem.MolToSmiles(rd_topology)
+            torsion_smiles, position_mapping = key_by_position(rd_topology, bond_variance)
 
             row = {
                 'torsion_name': name,
                 'torsion_smiles': torsion_smiles,
-                'torsion_mapping': _serialize_mapping(canonical_mapping),
+                'torsion_mapping': _serialize_mapping(position_mapping),
                 'torsion_success': True,
-                '_canonical_mapping': canonical_mapping,
+                '_position_mapping': position_mapping,
                 **stats,
             }
             results.append(row)
@@ -186,7 +183,7 @@ class CalculateTorsions(BaseActor):
     Output columns:
         - torsion_name: Molecule name/identifier (derived from confs actor)
         - torsion_smiles: SMILES with explicit hydrogens for molecule reconstruction
-        - torsion_mapping: JSON with 'canonical_atom_ranks' and 'circular_variance'
+        - torsion_mapping: JSON with 'smiles_atom_positions' and 'circular_variance'
         - torsion_success: Boolean flag for successful torsion calculation
         - n_confs: Number of conformers analyzed
         - n_torsions: Total torsions detected
@@ -440,7 +437,7 @@ class CalculateTorsions(BaseActor):
             f"({total_time:.1f}s total, avg {avg_chunk:.1f}s/chunk)"
         )
 
-        return pd.DataFrame(all_results)
+        return pd.DataFrame(all_results) if all_results else pd.DataFrame([_default_row()]).iloc[:0]
 
     def _process_chunk(
         self,
@@ -485,30 +482,25 @@ class CalculateTorsions(BaseActor):
         chunk_molecules = []
         chunk_mappings = []
 
-        smiles_params = Chem.SmilesParserParams()
-        smiles_params.removeHs = False
-
         for name, _ in chunk_data:
             row = processed_results.get(name, _default_row(name))
-            canonical_mapping = row.pop('_canonical_mapping', None)
+            position_mapping = row.pop('_position_mapping', None)
 
             if row['torsion_success']:
                 if self.min_confs is not None and row['n_confs'] < self.min_confs:
                     _mark_failed(row, f"Minimum conformers: {row['n_confs']} < {self.min_confs}")
                 else:
-                    mol_obj = Chem.MolFromSmiles(row['torsion_smiles'], smiles_params)
+                    mol_obj = parse_smiles(row['torsion_smiles'])
                     if mol_obj is None:
                         _mark_failed(row, 'SMILES reconstruction: MolFromSmiles returned None')
                     else:
                         try:
-                            bond_map = CanonicalBondProperties.canonical_to_bond_idx(
-                                mol_obj, canonical_mapping
-                            )
+                            bond_map = bond_values_at(mol_obj, position_mapping)
                             mol_obj.SetProp('_Name', name)
                             chunk_molecules.append(mol_obj)
                             chunk_mappings.append(bond_map)
                         except (ValueError, KeyError) as e:
-                            _mark_failed(row, f"Bond canonicalization: {e}")
+                            _mark_failed(row, f"Bond transfer: {e}")
 
             rows.append(row)
 
