@@ -1,36 +1,32 @@
 """
 Flexibility analysis actor plugin.
 
-Computes per-bond descriptors for molecules with conformers. Consumes GenerateConfs
-output, streams molecules in chunks, processes in parallel, and writes one pickle
-sidecar per endpoint that the torsmiles dataset builder reads directly:
-
-    <run>/torsions/<endpoint>/chunk_XXXX.pkl   = (molecules, mappings)   + manifest.json
-
-Both endpoints come from one conformer-generation run; each subfolder is self-contained.
+Analyzes flexibility properties for molecules with conformers.
 Requires phd-tools package for calculations.
 """
 from typing import List, Dict, Optional, Any, Tuple
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 import math
 import os
 import pickle
+import subprocess
 import time
 
 import pandas as pd
-from rdkit import Chem
 from joblib import Parallel, delayed
 
 try:
     from phd_tools.chemistry.flexibility import FlexibilityCalculator
-    from phd_tools.chemistry.savebonds import CanonicalBondProperties
+    from phd_tools.chemistry.savebonds import (key_torsions_by_position, parse_smiles,
+                                               torsion_values_at)
     FLEX_AVAILABLE = True
 except ImportError:
     FLEX_AVAILABLE = False
     FlexibilityCalculator = None
-    CanonicalBondProperties = None
+    key_torsions_by_position = parse_smiles = torsion_values_at = None
 
 from molforge.actors.base import BaseActor
 from molforge.actors.protocol import ActorOutput
@@ -38,6 +34,7 @@ from molforge.actors.params.base import BaseParams
 from molforge.utils.constants import MAX_CHUNK_SIZE, DEFAULT_MP_THRESHOLD, DEFAULT_N_JOBS
 
 ENDPOINTS = ("V", "S")
+FORMAT_VERSION = 2
 
 
 # ============================================================================
@@ -90,14 +87,30 @@ def _mark_failed(row: Dict, warning: str) -> None:
     row["warnings"].append(warning)
 
 
-def _serialize_mapping(canonV: Dict, canonS: Dict) -> str:
-    """Canonical V/S mapping -> JSON column (inspection only; torsmiles reads the pickles)."""
-    if not canonV:
+def _code_identity(module) -> Dict[str, Any]:
+    directory = os.path.dirname(os.path.abspath(module.__file__))
+
+    def git(*args) -> Optional[str]:
+        try:
+            out = subprocess.run(["git", "-C", directory, *args], capture_output=True, text=True,
+                                 timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout.strip() if out.returncode == 0 else None
+
+    status = git("status", "--porcelain", "--untracked-files=no")
+    return {"commit": git("rev-parse", "HEAD"),
+            "uncommitted_changes": None if status is None else bool(status)}
+
+
+def _serialize_mapping(torsions: Dict) -> str:
+    """Serialize mapping to JSON for CSV-safe storage."""
+    if not torsions:
         return "{}"
-    keys = list(canonV.keys())
+    keys = list(torsions)
     return json.dumps({
-        "canonical_atom_ranks": [list(k) for k in keys],
-        "V": [canonV[k] for k in keys], "S": [canonS[k] for k in keys],
+        "torsion_atom_positions": [list(k) for k in keys],
+        "V": [torsions[k]["V"] for k in keys], "S": [torsions[k]["S"] for k in keys],
     })
 
 
@@ -118,16 +131,14 @@ def _process_batch_worker(batch: List, config: Dict) -> List[Dict]:
                 r = _default_row(name)
                 r["warnings"] = [f"Minimum conformers: {stats['n_confs']} < {min_confs}"]
                 rows.append(r); continue
-            canonV = CanonicalBondProperties.bond_idx_to_canonical(
-                rd, {b: rec["V"] for b, rec in labels.items()})
-            canonS = CanonicalBondProperties.bond_idx_to_canonical(
-                rd, {b: rec["S"] for b, rec in labels.items()})
+            smiles, torsions = key_torsions_by_position(
+                rd, {rec["torsion_atoms"]: {e: rec[e] for e in ENDPOINTS} for rec in labels.values()})
             rows.append({
                 "flexibility_name": name,
-                "flexibility_smiles": Chem.MolToSmiles(rd),
-                "flexibility_mapping": _serialize_mapping(canonV, canonS),
+                "flexibility_smiles": smiles,
+                "flexibility_mapping": _serialize_mapping(torsions),
                 "flexibility_success": True,
-                "_canonical_V": canonV, "_canonical_S": canonS,
+                "_torsion_positions": torsions,
                 "n_confs": stats["n_confs"], "n_bonds": stats["n_bonds"],
                 "mean_V": stats["mean_V"], "low_confs": stats["low_confs"], "warnings": [],
             })
@@ -189,6 +200,7 @@ class CalculateFlexibility(BaseActor):
 
         n_with = int(df["conformer_success"].sum())
         self.log(f"Received {len(df):,} molecules ({n_with:,} with conformers).")
+        self._write_provenance()
 
         results = self._process_chunked(gc_actor.extract_molecules(),
                                         gc_actor.get_successful_names())
@@ -269,40 +281,62 @@ class CalculateFlexibility(BaseActor):
             batch_results = [_process_batch_worker(chunk_data, self._calc_config)]
 
         processed = {row["flexibility_name"]: row for br in batch_results for row in br}
-        rows, mols, maps = [], [], {e: [] for e in ENDPOINTS}
-        params = Chem.SmilesParserParams(); params.removeHs = False
-        canon_key = {"V": "_canonical_V", "S": "_canonical_S"}
+        rows, names, mols, torsions = [], [], [], []
+        maps = {e: [] for e in ENDPOINTS}
         for name, _ in chunk_data:
             row = processed.get(name, _default_row(name))
-            canon = {e: row.pop(canon_key[e], None) for e in ENDPOINTS}
+            positions = row.pop("_torsion_positions", None)
             if row["flexibility_success"]:
-                mol_obj = Chem.MolFromSmiles(row["flexibility_smiles"], params)
+                mol_obj = parse_smiles(row["flexibility_smiles"])
                 if mol_obj is None:
                     _mark_failed(row, "SMILES reconstruction: MolFromSmiles returned None")
                 else:
                     try:
-                        bond_maps = {e: CanonicalBondProperties.canonical_to_bond_idx(
-                            mol_obj, canon[e]) for e in ENDPOINTS}
-                        mol_obj.SetProp("_Name", name)
+                        torsion_atoms, values = torsion_values_at(mol_obj, positions)
+                        bond_maps = {e: {b: v[e] for b, v in values.items()} for e in ENDPOINTS}
+                        names.append(name)
                         mols.append(mol_obj)
+                        torsions.append(torsion_atoms)
                         for e in ENDPOINTS:
                             maps[e].append(bond_maps[e])
-                    except (ValueError, KeyError) as e:
-                        _mark_failed(row, f"Bond canonicalization: {e}")
+                    except (ValueError, KeyError) as error:
+                        _mark_failed(row, f"Label transfer: {error}")
             rows.append(row)
 
         entries = {e: None for e in ENDPOINTS}
         if mols:
             for e in ENDPOINTS:
-                entries[e] = self._save_chunk(e, mols, maps[e], chunk_idx)
+                entries[e] = self._save_chunk(e, names, mols, maps[e], torsions, chunk_idx)
         return rows, entries
 
-    def _save_chunk(self, endpoint: str, molecules: List, mappings: List, chunk_idx: int) -> Dict:
+    def _save_chunk(self, endpoint: str, names: List[str], molecules: List, mappings: List,
+                    torsion_atoms: List, chunk_idx: int) -> Dict:
         filename = f"chunk_{chunk_idx:04d}.pkl"
-        names = [m.GetProp("_Name") if m.HasProp("_Name") else "" for m in molecules]
         with open(self.endpoint_dir(endpoint) / filename, "wb") as f:
-            pickle.dump((molecules, mappings), f)
-        return {"file": filename, "names": names, "count": len(molecules)}
+            pickle.dump({"format_version": FORMAT_VERSION, "names": names, "molecules": molecules,
+                         "values": mappings, "torsion_atoms": torsion_atoms}, f)
+        return {"file": filename, "names": names, "count": len(molecules),
+                "format_version": FORMAT_VERSION}
+
+    def _write_provenance(self) -> None:
+        import molforge
+        import phd_tools
+        import rdkit
+        record = {
+            "format_version": FORMAT_VERSION,
+            "endpoints": list(ENDPOINTS),
+            "parameters": {**{k: v for k, v in self._calc_config.items() if not k.startswith("_")},
+                           "min_confs": self.min_confs, "chunk_size": self.chunk_size},
+            "code": {"molforge": _code_identity(molforge), "phd_tools": _code_identity(phd_tools),
+                     "rdkit": rdkit.__version__},
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        path = Path(self._get_run_path("torsions")) / "provenance.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(record, f, indent=2)
+        os.replace(tmp, path)
 
     def _write_manifest(self, endpoint: str, manifest: List[Dict]) -> None:
         """Atomically replace the endpoint manifest (temp file + os.replace) so a crash
